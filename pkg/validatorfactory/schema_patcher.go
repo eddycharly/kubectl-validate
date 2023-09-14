@@ -25,9 +25,18 @@ type SchemaPatch struct {
 	Transformer         utils.SchemaVisitor
 }
 
-func isTimeSchema(s string) bool {
-	return s == "io.k8s.apimachinery.pkg.apis.meta.v1.Time" || s == "io.k8s.apimachinery.pkg.apis.meta.v1.MicroTime"
-}
+// These are native types in k8s which have a custom `MarshalJSON` which handles
+// `null`
+var nullableSchemas sets.Set[string] = sets.New(
+	"io.k8s.apimachinery.pkg.runtime.RawExtension",
+	"io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+	"io.k8s.apimachinery.pkg.apis.meta.v1.MicroTime",
+	"io.k8s.apimachinery.pkg.apis.meta.v1.Duration",
+	"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.JSON",
+	"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.JSONSchemaPropsOrBool",
+	"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.JSONSchemaPropsOrStringArray",
+	"io.k8s.apimachinery.pkg.api.resource.Quantity",
+)
 
 func isBuiltInType(gv schema.GroupVersion) bool {
 	// filter out non built-in types
@@ -78,15 +87,26 @@ var schemaPatches []SchemaPatch = []SchemaPatch{
 		}),
 	},
 	{
-		Slug:                "FixTime",
-		AppliesToDefinition: isTimeSchema,
-		Description:         "metav1.Time published OpenAPI definitions do not allow empty/null, but Kubernetes in practice does.",
+		Slug:                "AnnotateNullable",
+		AppliesToDefinition: nullableSchemas.Has,
+		Description:         "Some published OpenAPI definitions do not allow empty/null, but Kubernetes in practice does.",
 		Transformer: utils.PostorderVisitor(func(ctx utils.VisitingContext, s *spec.Schema) bool {
-			if s.Format != "date-time" || len(s.Type) != 1 || s.Type[0] != "string" || s.Nullable {
-				return true
-			}
-
 			s.Nullable = true
+			return true
+		}),
+	},
+	{
+		Slug:                "IntOrStringDefinition",
+		AppliesToDefinition: func(s string) bool { return s == "io.k8s.apimachinery.pkg.util.intstr.IntOrString" },
+		Description:         "Int Or String definition is ignored on apiserver and replaced with x-kubernetes-int-or-string",
+		Transformer: utils.PostorderVisitor(func(ctx utils.VisitingContext, s *spec.Schema) bool {
+			*s = spec.Schema{
+				VendorExtensible: spec.VendorExtensible{
+					Extensions: spec.Extensions{
+						"x-kubernetes-int-or-string": true,
+					},
+				},
+			}
 			return true
 		}),
 	},
@@ -104,17 +124,11 @@ var schemaPatches []SchemaPatch = []SchemaPatch{
 			//	make sense
 			// These are all struct types in upstream k8s which implement
 			//	OpenAPISchemaType to something other than `struct`
-			toWipe := sets.New(
-				"io.k8s.apimachinery.pkg.api.resource.Quantity",
-				"io.k8s.apimachinery.pkg.runtime.RawExtension",
+			toWipe := nullableSchemas.Clone()
+			toWipe.Insert(
 				"io.k8s.apimachinery.pkg.util.intstr.IntOrString",
-				"io.k8s.apimachinery.pkg.apis.meta.v1.Time",
-				"io.k8s.apimachinery.pkg.apis.meta.v1.MicroTime",
-				"io.k8s.apimachinery.pkg.apis.meta.v1.Duration",
-				"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.JSON",
-				"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.JSONSchemaPropsOrBool",
-				"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.JSONSchemaPropsOrStringArray",
 			)
+
 			shouldPatch := toWipe.Has(filepath.Base(s.Ref.String()))
 			for _, subschema := range s.AllOf {
 				if toWipe.Has(filepath.Base(subschema.Ref.String())) {
@@ -123,11 +137,10 @@ var schemaPatches []SchemaPatch = []SchemaPatch{
 				}
 			}
 
-			if !shouldPatch {
-				return true
+			if shouldPatch {
+				s.Default = nil
 			}
 
-			s.Default = nil
 			return true
 		}),
 	},
